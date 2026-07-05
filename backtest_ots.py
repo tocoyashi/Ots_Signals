@@ -1,7 +1,6 @@
 """
-OTS 4H Trading System V1.2 — Backtest Engine
-Tests all 7 systems + Scalp on 4 pairs over 4 months.
-Sends results to Telegram.
+OTS Precision Bot V2.0 — Backtest Engine
+VOL Core + Confluence (RSI/S/R/Pressure) + Daily Trend + ADX Filter
 """
 
 import os
@@ -15,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 
 pd.set_option('future.no_silent_downcasting', True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("OTS-Backtest")
+logger = logging.getLogger("OTS-Precision-BT")
 
 # ═══════════════════════════════════════════
 #  CONFIG
@@ -23,49 +22,44 @@ logger = logging.getLogger("OTS-Backtest")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
 EXCHANGE_NAME = os.environ.get("EXCHANGE_NAME", "mexc")
-SYMBOLS = [
-    "BTC/USDT", "ADA/USDT", "XRP/USDT",
-]
+SYMBOLS = ["BTC/USDT", "ADA/USDT", "XRP/USDT", "ETH/USDT", "SOL/USDT", "DOGE/USDT"]
 TIMEFRAME = "1h"
 INITIAL_BALANCE = 10000.0
-RISK_PER_TRADE_PCT = 2.0  # 2% of balance per trade
+RISK_PER_TRADE_PCT = 2.0
 BACKTEST_MONTHS = 4
 
-# RSI SYSTEM
+# VOL SYSTEM (Core)
+VOL_LENGTH = 14
+VOL_MULTIPLIER = 2.5
+VOL_COOLDOWN = 10
+VOL_DISTANCE_PERCENT = 7.0
+
+# RSI SYSTEM (Confluence)
 RSI_LENGTH = 14
 RSI_UPPER = 65.0
 RSI_LOWER = 35.0
-RSI_COOLDOWN = 20
 RSI_MAX_DISTANCE = 2.2
 RSI_MAX_CANDLE = 2.0
 
-# S/R SYSTEM
-SR_PIVOT_LEN = 10
-SR_MIN_DISTANCE = 0.5
+# S/R SYSTEM (Confluence)
 SR_MAX_DIST_EMA = 2.0
 SR_MAX_CANDLE = 2.0
-SR_COOLDOWN = 15
 
-# VOLUME SYSTEM (relaxed for 1H)
-VOL_LENGTH = 14
-VOL_MULTIPLIER = 3.0
-VOL_COOLDOWN = 10
-VOL_DISTANCE_PERCENT = 4.0
-
-# PRESSURE SYSTEM (strict — high quality signals)
+# PRESSURE SYSTEM (Confluence)
 PRESSURE_RSI_PERIOD = 50
 PRESSURE_RATE = 45
 PRESSURE_THRESHOLD = 500
 PRESSURE_EMA_DIST = 5.0
 
-# SCALP SYSTEM
-SCALP_COOLDOWN = 10
-SCALP_EMA_FAR = 1.5
-SCALP_MAX_EMA200 = 3.0
-SCALP_SL_PCT = 2.0
-SCALP_TP_PCT = 0.85
+# FILTERS
+ADX_LENGTH = 14
+ADX_MIN = 10.0
 
-# TP/SL (Normal signals)
+# DAILY TREND
+DAILY_EMA_FAST = 50
+DAILY_EMA_SLOW = 200
+
+# TP/SL
 SL_PCT = 3.5
 TP1_PCT = 1.0
 TP2_PCT = 3.0
@@ -82,11 +76,6 @@ def rma(s, length):
 def ema(s, length):
     return s.ewm(span=length, adjust=False).mean()
 
-def hma(s, length):
-    half = length // 2
-    sqrt_len = int(np.sqrt(length))
-    return ema(2 * ema(s, half) - ema(s, length), sqrt_len)
-
 def rsi_calc(close, length=14):
     delta = close.diff()
     up = delta.clip(lower=0)
@@ -96,18 +85,24 @@ def rsi_calc(close, length=14):
     val = np.where(down_r == 0, 100.0, np.where(up_r == 0, 0.0, 100.0 - 100.0 / (1.0 + up_r / down_r)))
     return pd.Series(val, index=close.index)
 
-def bcwsma(series, length, m=1):
-    result = pd.Series(np.nan, index=series.index)
-    for i in range(len(series)):
-        if i == 0:
-            result.iloc[i] = series.iloc[i]
-        else:
-            prev = result.iloc[i - 1]
-            if pd.isna(prev):
-                result.iloc[i] = series.iloc[i]
-            else:
-                result.iloc[i] = (m * series.iloc[i] + (length - m) * prev) / length
-    return result
+def adx_calc(high, low, close, length=14):
+    plus_dm = high.diff()
+    minus_dm = -low.diff()
+    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
+    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    atr = rma(tr, length)
+    plus_di = 100 * rma(plus_dm, length) / atr
+    minus_di = 100 * rma(minus_dm, length) / atr
+
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    adx = rma(dx, length)
+    return adx, plus_di, minus_di
 
 def apply_cooldown(signals, cooldown):
     result = signals.copy()
@@ -121,112 +116,41 @@ def apply_cooldown(signals, cooldown):
 
 
 # ═══════════════════════════════════════════
-#  SYSTEMS (same as bot.py)
+#  SIGNAL SYSTEMS
 # ═══════════════════════════════════════════
 
-def rsi_system(df):
-    rsi = df["rsi"]
-    close = df["close"]
-    e150 = df["ema150"]
-    e500 = df["ema500"]
-    is_up = rsi > RSI_UPPER
-    is_down = rsi < RSI_LOWER
-    buy_cross = is_up & ~is_up.shift(1).fillna(False).infer_objects(copy=False)
-    sell_cross = is_down & ~is_down.shift(1).fillna(False).infer_objects(copy=False)
-    e150_above = e150 > e500
-    e150_below = e150 < e500
-    dist = ((close - e150) / e150).abs() * 100
-    near = dist <= RSI_MAX_DISTANCE
-    candle = ((close - df["open"]) / df["open"]).abs() * 100
-    valid_c = candle <= RSI_MAX_CANDLE
-    buy = buy_cross & (close > e150) & near & valid_c & e150_above
-    sell = sell_cross & (close < e150) & near & valid_c & e150_below
-    return apply_cooldown(buy, RSI_COOLDOWN), apply_cooldown(sell, RSI_COOLDOWN), "RSI"
-
-
-def kdj_system(df):
-    close = df["close"]
-    high = df["high"]
-    low = df["low"]
-    e200 = df["ema200"]
-    df["hma50"] = hma(close, KDJ_HMA_LEN)
-    hma50 = df["hma50"]
-    kdj_h = high.rolling(KDJ_LOOKBACK).max()
-    kdj_l = low.rolling(KDJ_LOOKBACK).min()
-    rsv = 100.0 * ((close - kdj_l) / (kdj_h - kdj_l)).fillna(50)
-    pK = bcwsma(rsv, KDJ_PERIOD)
-    pD = bcwsma(pK, KDJ_PERIOD)
-    cross_up = (pK > pD) & (pK.shift(1) <= pD.shift(1).fillna(0))
-    cross_down = (pK < pD) & (pK.shift(1) >= pD.shift(1).fillna(0))
-    hma_up = (close > hma50) & (close.shift(1) <= hma50.shift(1).fillna(close))
-    hma_down = (close < hma50) & (close.shift(1) >= hma50.shift(1).fillna(close))
-    candle = ((close - df["open"]) / close).abs() * 100
-    valid_c = (candle >= KDJ_MIN_CANDLE) & (candle <= KDJ_MAX_CANDLE)
-    dist = ((close - e200) / close).abs() * 100
-    valid_d = dist <= KDJ_MAX_DIST_EMA
-    buy = cross_up & (close > e200) & hma_up & valid_c & valid_d
-    sell = cross_down & (close < e200) & hma_down & valid_c & valid_d
-    return apply_cooldown(buy, KDJ_COOLDOWN), apply_cooldown(sell, KDJ_COOLDOWN), "KDJ"
-
-
-def sr_system(df):
-    rsi = df["rsi"]
-    close = df["close"]
-    e200 = df["ema200"]
-    is_up = rsi > 70.0
-    is_down = rsi < 30.0
-    buy_base = is_up & ~is_up.shift(1).fillna(False).infer_objects(copy=False)
-    sell_base = is_down & ~is_down.shift(1).fillna(False).infer_objects(copy=False)
-    dist = ((close - e200) / e200).abs() * 100
-    near = dist <= SR_MAX_DIST_EMA
-    candle = ((close - df["open"]) / df["open"]).abs() * 100
-    valid_c = candle <= SR_MAX_CANDLE
-    buy = buy_base & (close > e200) & near & valid_c
-    sell = sell_base & (close < e200) & near & valid_c
-    return apply_cooldown(buy, SR_COOLDOWN), apply_cooldown(sell, SR_COOLDOWN), "S/R"
-
-
-def ots_system(df):
-    close = df["close"].values
-    open_ = df["open"].values
-    high = df["high"].values
-    low = df["low"].values
-    e250 = df["ema250"]
-    n = len(close)
-    result = np.zeros(n, dtype=int)
-    bindex = sindex = 0
-    for i in range(4, n):
-        if close[i] > close[i - 4]: bindex += 1
-        if close[i] < close[i - 4]: sindex += 1
-        if sindex > OTS_DELTA and close[i] > open_[i]:
-            if low[i] <= np.min(low[i - OTS_ALPHA + 1: i + 1]):
-                result[i] = 1; sindex = 0
-        if bindex > OTS_DELTA and close[i] < open_[i]:
-            if high[i] >= np.max(high[i - OTS_ALPHA + 1: i + 1]):
-                result[i] = -1; bindex = 0
-    lelec = pd.Series(result, index=df.index)
-    buy = (lelec == 1) & (df["close"] > e250)
-    sell = (lelec == -1) & (df["close"] < e250)
-    return buy, sell, "OTS"
-
-
 def vol_system(df):
-    close = df["close"]
-    open_ = df["open"]
-    vol = df["volume"]
-    e250 = df["ema250"]
+    close, open_, vol, e250 = df["close"], df["open"], df["volume"], df["ema250"]
     bull = np.where(close > open_, vol, 0)
     bear = np.where(open_ > close, vol, 0)
     bull_s = pd.Series(bull, index=df.index)
     bear_s = pd.Series(bear, index=df.index)
     bullma = ema(bull_s, VOL_LENGTH)
     bearma = ema(bear_s, VOL_LENGTH)
+
     buy = (bull_s > bullma * VOL_MULTIPLIER) & (bull_s.shift(1) <= (bullma.shift(1) * VOL_MULTIPLIER).fillna(0))
     sell = (bear_s > bearma * VOL_MULTIPLIER) & (bear_s.shift(1) <= (bearma.shift(1) * VOL_MULTIPLIER).fillna(0))
+
     dp = ((close - e250) / e250) * 100
     buy = buy & (dp >= 0) & (dp <= VOL_DISTANCE_PERCENT)
     sell = sell & (dp <= 0) & (dp >= -VOL_DISTANCE_PERCENT)
-    return apply_cooldown(buy, VOL_COOLDOWN), apply_cooldown(sell, VOL_COOLDOWN), "VOL"
+    return apply_cooldown(buy, VOL_COOLDOWN), apply_cooldown(sell, VOL_COOLDOWN)
+
+
+def rsi_confluence(df):
+    """RSI direction confluence"""
+    rsi = df["rsi"]
+    buy = (rsi > 50.0)   # RSI bullish
+    sell = (rsi < 50.0)  # RSI bearish
+    return buy, sell
+
+
+def sr_confluence(df):
+    """S/R extreme confluence"""
+    rsi = df["rsi"]
+    buy = (rsi > 60.0)   # RSI strongly bullish
+    sell = (rsi < 40.0)  # RSI strongly bearish
+    return buy, sell
 
 
 def pressure_system(df):
@@ -235,9 +159,11 @@ def pressure_system(df):
     r2 = rsi_calc(r1, PRESSURE_RSI_PERIOD)
     r3 = rsi_calc(r2, PRESSURE_RSI_PERIOD)
     rsim = r1 * 5 - r2 * 3 + r3
+
     diff = (rsim - rsim.shift(1).fillna(0)) * PRESSURE_RATE
     rsim_up = pd.Series(0.0, index=df.index)
     rsim_down = pd.Series(0.0, index=df.index)
+
     for i in range(1, len(df)):
         d = diff.iloc[i]
         if d > 0:
@@ -254,45 +180,28 @@ def pressure_system(df):
             else:
                 rsim_up.iloc[i] = rsim_up.iloc[i - 1]
                 rsim_down.iloc[i] = 0
+
     dp = ((close - df["ema250"]) / df["ema250"]) * 100
     is_up_rsi = df["rsi"] > RSI_UPPER
     is_down_rsi = df["rsi"] < RSI_LOWER
+
     buy = (rsim_up > 0) & (rsim_up.shift(1).fillna(0) == 0) & (diff > PRESSURE_THRESHOLD) & (dp < -PRESSURE_EMA_DIST) & ~is_down_rsi
     sell = (rsim_down < 0) & (rsim_down.shift(1).fillna(0) == 0) & (diff < -PRESSURE_THRESHOLD) & (dp > PRESSURE_EMA_DIST) & ~is_up_rsi
-    return buy, sell, "Pressure"
-
-
-def scalp_system(df):
-    rsi = df["rsi"]
-    close = df["close"]
-    e150 = df["ema150"]
-    e200 = df["ema200"]
-    is_up = rsi > RSI_UPPER
-    is_down = rsi < RSI_LOWER
-    buy_cross = is_up & ~is_up.shift(1).fillna(False).infer_objects(copy=False)
-    sell_cross = is_down & ~is_down.shift(1).fillna(False).infer_objects(copy=False)
-    ema_dist = ((e150 - e200) / e200).abs() * 100
-    is_far = ema_dist >= SCALP_EMA_FAR
-    tiny_dist = ((close - e200) / e200).abs() * 100
-    near = tiny_dist <= SCALP_MAX_EMA200
-    buy = buy_cross & (close > e150) & ~is_far & near
-    sell = sell_cross & (close < e150) & ~is_far & near
-    return apply_cooldown(buy, SCALP_COOLDOWN), apply_cooldown(sell, SCALP_COOLDOWN), "Scalp"
+    return buy, sell
 
 
 # ═══════════════════════════════════════════
 #  BACKTEST ENGINE
 # ═══════════════════════════════════════════
 
-def fetch_data(exchange, symbol, months=BACKTEST_MONTHS):
-    """Fetch 4H data — need extra for EMA500 warmup (~2000 bars = ~333 days)"""
-    since = int((datetime.now(timezone.utc) - timedelta(days=365 * 2)).timestamp() * 1000)
-    logger.info(f"  Fetching {symbol} ...")
+def fetch_data(exchange, symbol, timeframe):
+    since = int((datetime.now(timezone.utc) - timedelta(days=730)).timestamp() * 1000)
+    logger.info(f"  Fetching {symbol} {timeframe} ...")
     all_candles = []
-    FETCH_LIMIT = 500  # MEXC returns max 500 per request
+    FETCH_LIMIT = 500
     while True:
         try:
-            batch = exchange.fetch_ohlcv(symbol, TIMEFRAME, since=since, limit=FETCH_LIMIT)
+            batch = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=FETCH_LIMIT)
         except Exception as e:
             logger.error(f"    Fetch error: {e}")
             break
@@ -302,488 +211,373 @@ def fetch_data(exchange, symbol, months=BACKTEST_MONTHS):
         since = batch[-1][0] + 1
         if len(batch) < FETCH_LIMIT:
             break
-        time.sleep(0.5)
+        time.sleep(0.3)
 
     df = pd.DataFrame(all_candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df = df.set_index("timestamp")
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna()
-
-    # Keep only last BACKTEST_MONTHS for trading
-    cutoff = df.index[-1] - pd.DateOffset(months=BACKTEST_MONTHS)
-    df_full = df.copy()  # Full data for indicator warmup
-    df_trade = df[df.index >= cutoff].copy()
-
-    return df_full, df_trade
+    return df.dropna()
 
 
-def prepare_indicators(df_full):
-    """Calculate all indicators on full data"""
+def prepare_1h(df_full):
     df = df_full.copy()
     df["rsi"] = rsi_calc(df["close"], RSI_LENGTH)
     df["ema150"] = ema(df["close"], 150)
     df["ema200"] = ema(df["close"], 200)
     df["ema250"] = ema(df["close"], 250)
     df["ema500"] = ema(df["close"], 500)
+    df["adx"], df["plus_di"], df["minus_di"] = adx_calc(df["high"], df["low"], df["close"], ADX_LENGTH)
     return df
 
 
-def run_backtest_on_symbol(df_full, df_trade, symbol):
-    """Run backtest for one symbol. Returns list of trade dicts."""
-    df = prepare_indicators(df_full)
+def get_daily_trend_series(df_daily):
+    """Return series of daily trend: 1=BULLISH, -1=BEARISH, 0=NEUTRAL"""
+    e50 = ema(df_daily["close"], DAILY_EMA_FAST)
+    e200 = ema(df_daily["close"], DAILY_EMA_SLOW)
+    price = df_daily["close"]
 
-    # Get all signals
-    all_systems = [
-        rsi_system(df), sr_system(df),
-        vol_system(df), pressure_system(df),
-    ]
-    # Build signal timeline (only in trade window)
-    trade_start = df_trade.index[0]
-    trade_end = df_trade.index[-1]
+    trend = pd.Series(0, index=df_daily.index)
+    trend[(e50 > e200) & (price > e50)] = 1   # BULLISH
+    trend[(e50 < e200) & (price < e50)] = -1  # BEARISH
+    return trend  # 1=BULL, -1=BEAR, 0=NEUTRAL
 
+
+def run_backtest_symbol(exchange, symbol):
+    # Fetch data
+    df_1h_full = fetch_data(exchange, symbol, TIMEFRAME)
+    df_daily_full = fetch_data(exchange, symbol, "1d")
+
+    if df_1h_full is None or df_daily_full is None or len(df_1h_full) < 600:
+        return []
+
+    # Prepare indicators
+    df = prepare_1h(df_1h_full)
+    daily_trend = get_daily_trend_series(df_daily_full)
+
+    # Map daily trend to 1H bars using reindex + ffill
+    daily_1h = daily_trend.reindex(df.index, method="ffill").fillna(0)
+
+    # Get signals
+    vol_buy, vol_sell = vol_system(df)
+    rsi_buy, rsi_sell = rsi_confluence(df)
+    sr_buy, sr_sell = sr_confluence(df)
+    prs_buy, prs_sell = pressure_system(df)
+
+    # Trade window
+    cutoff = df.index[-1] - pd.DateOffset(months=BACKTEST_MONTHS)
+
+    # Build trades
     trades = []
+    for i in range(len(df)):
+        idx = df.index[i]
+        if idx < cutoff:
+            continue
 
-    for buy_col, sell_col, sys_name in all_systems:
-        for idx in df.index:
-            if idx < trade_start or idx > trade_end:
-                continue
-            # Only take signal at this exact bar
-            if buy_col.loc[idx]:
+        dt = daily_1h.iloc[i]
+        # Determine minimum confluence and trend alignment
+        if dt == 0:
+            min_conf = 1  # NEUTRAL: 1+ confluence
+            allow_long = True
+            allow_short = True
+        elif dt == 1:  # BULLISH
+            min_conf = 1
+            allow_long = True
+            allow_short = False
+        else:  # BEARISH
+            min_conf = 1
+            allow_long = False
+            allow_short = True
+
+        # ADX filter
+        adx_val = df["adx"].iloc[i]
+        if pd.isna(adx_val) or adx_val < ADX_MIN:
+            continue
+
+        # Check LONG
+        if vol_buy.iloc[i] and allow_long:
+            confluence = []
+            if rsi_buy.iloc[i]: confluence.append("RSI")
+            if sr_buy.iloc[i]: confluence.append("S/R")
+            if prs_buy.iloc[i]: confluence.append("Pressure")
+            if len(confluence) >= min_conf:
                 trades.append({
-                    "time": idx, "symbol": symbol, "system": sys_name,
-                    "type": "LONG", "entry": df.loc[idx, "close"],
-                    "is_scalp": False
+                    "time": idx, "symbol": symbol, "type": "LONG",
+                    "entry": df["close"].iloc[i],
+                    "confluence": confluence, "adx": adx_val,
+                    "strength": len(confluence),
                 })
-            if sell_col.loc[idx]:
+
+        # Check SHORT
+        if vol_sell.iloc[i] and allow_short:
+            confluence = []
+            if rsi_sell.iloc[i]: confluence.append("RSI")
+            if sr_sell.iloc[i]: confluence.append("S/R")
+            if prs_sell.iloc[i]: confluence.append("Pressure")
+            if len(confluence) >= min_conf:
                 trades.append({
-                    "time": idx, "symbol": symbol, "system": sys_name,
-                    "type": "SHORT", "entry": df.loc[idx, "close"],
-                    "is_scalp": False
+                    "time": idx, "symbol": symbol, "type": "SHORT",
+                    "entry": df["close"].iloc[i],
+                    "confluence": confluence, "adx": adx_val,
+                    "strength": len(confluence),
                 })
 
     return trades, df
 
 
 def simulate_trades(trades, df):
-    """Simulate trade outcomes using future bars"""
+    tp_levels = [(TP1_PCT, 0.50), (TP2_PCT, 0.40), (TP3_PCT, 0.10)]
     results = []
+
     for t in trades:
-        entry_price = t["entry"]
+        entry = t["entry"]
         is_long = t["type"] == "LONG"
-        is_scalp = t["is_scalp"]
 
-        if is_scalp:
-            sl_pct = SCALP_SL_PCT
-            tp1_pct = SCALP_TP_PCT
-            # Scalp: simple TP1/SL, no TP2/TP3
-            tp_levels = [(tp1_pct, 1.0)]  # (pct, weight)
-        else:
-            sl_pct = SL_PCT
-            tp_levels = [
-                (TP1_PCT, 0.50),   # 50% at TP1
-                (TP2_PCT, 0.40),   # 40% at TP2
-                (TP3_PCT, 0.10),   # 10% at TP3
-            ]
-
-        # Find the bar index in df
         try:
             bar_idx = df.index.get_loc(t["time"])
         except KeyError:
             continue
 
-        # Look ahead for exit (max 50 bars = ~8 days)
-        exit_price = None
-        exit_bar = None
-        exit_reason = ""
+        remaining_weight = 1.0
+        weighted_exit = 0.0
+        tp_idx = 0
+        closed = False
 
-        if is_scalp:
-            for j in range(bar_idx + 1, min(bar_idx + 200, len(df))):
-                h = df.iloc[j]["high"]
-                l = df.iloc[j]["low"]
-                if is_long:
-                    if l <= entry_price * (1 - sl_pct / 100):
-                        exit_price = entry_price * (1 - sl_pct / 100)
-                        exit_reason = "SL"; exit_bar = j; break
-                    if h >= entry_price * (1 + tp1_pct / 100):
-                        exit_price = entry_price * (1 + tp1_pct / 100)
-                        exit_reason = "TP1"; exit_bar = j; break
-                else:
-                    if h >= entry_price * (1 + sl_pct / 100):
-                        exit_price = entry_price * (1 + sl_pct / 100)
-                        exit_reason = "SL"; exit_bar = j; break
-                    if l <= entry_price * (1 - tp1_pct / 100):
-                        exit_price = entry_price * (1 - tp1_pct / 100)
-                        exit_reason = "TP1"; exit_bar = j; break
-        else:
-            # Multi-TP: track closed portions ACROSS bars
-            remaining_weight = 1.0
-            weighted_exit = 0.0
-            tp_idx = 0  # which TP level we're waiting for
-            closed_completely = False
+        for j in range(bar_idx + 1, min(bar_idx + 200, len(df))):
+            h, l = df.iloc[j]["high"], df.iloc[j]["low"]
 
-            for j in range(bar_idx + 1, min(bar_idx + 200, len(df))):
-                h = df.iloc[j]["high"]
-                l = df.iloc[j]["low"]
+            if is_long:
+                if l <= entry * (1 - SL_PCT / 100):
+                    weighted_exit += remaining_weight * entry * (1 - SL_PCT / 100)
+                    closed = True; break
+                if tp_idx < len(tp_levels):
+                    tp_pct, weight = tp_levels[tp_idx]
+                    if h >= entry * (1 + tp_pct / 100):
+                        weighted_exit += weight * entry * (1 + tp_pct / 100)
+                        remaining_weight -= weight
+                        tp_idx += 1
+                        if remaining_weight <= 0.01:
+                            closed = True; break
+            else:
+                if h >= entry * (1 + SL_PCT / 100):
+                    weighted_exit += remaining_weight * entry * (1 + SL_PCT / 100)
+                    closed = True; break
+                if tp_idx < len(tp_levels):
+                    tp_pct, weight = tp_levels[tp_idx]
+                    if l <= entry * (1 - tp_pct / 100):
+                        weighted_exit += weight * entry * (1 - tp_pct / 100)
+                        remaining_weight -= weight
+                        tp_idx += 1
+                        if remaining_weight <= 0.01:
+                            closed = True; break
 
-                if is_long:
-                    # Check SL first (on remaining portion)
-                    if l <= entry_price * (1 - sl_pct / 100):
-                        weighted_exit += remaining_weight * (entry_price * (1 - sl_pct / 100))
-                        exit_price = weighted_exit
-                        exit_reason = "SL"; exit_bar = j
-                        closed_completely = True; break
-
-                    # Check current TP level
-                    if tp_idx < len(tp_levels):
-                        tp_pct, weight = tp_levels[tp_idx]
-                        if h >= entry_price * (1 + tp_pct / 100):
-                            weighted_exit += weight * (entry_price * (1 + tp_pct / 100))
-                            remaining_weight -= weight
-                            tp_idx += 1
-                            if remaining_weight <= 0.01:
-                                exit_price = weighted_exit
-                                exit_reason = f"TP{tp_idx}"
-                                exit_bar = j
-                                closed_completely = True; break
-                else:
-                    if h >= entry_price * (1 + sl_pct / 100):
-                        weighted_exit += remaining_weight * (entry_price * (1 + sl_pct / 100))
-                        exit_price = weighted_exit
-                        exit_reason = "SL"; exit_bar = j
-                        closed_completely = True; break
-
-                    if tp_idx < len(tp_levels):
-                        tp_pct, weight = tp_levels[tp_idx]
-                        if l <= entry_price * (1 - tp_pct / 100):
-                            weighted_exit += weight * (entry_price * (1 - tp_pct / 100))
-                            remaining_weight -= weight
-                            tp_idx += 1
-                            if remaining_weight <= 0.01:
-                                exit_price = weighted_exit
-                                exit_reason = f"TP{tp_idx}"
-                                exit_bar = j
-                                closed_completely = True; break
-
-            if not closed_completely and remaining_weight > 0.01:
-                # Close remaining at last bar's close
-                last_j = min(bar_idx + 200, len(df)) - 1
-                weighted_exit += remaining_weight * df.iloc[last_j]["close"]
-                exit_price = weighted_exit
-                exit_reason = "TIMEOUT"
-                exit_bar = last_j
-
-        # If no exit found within max bars, close at last available close
-        if exit_price is None:
+        if not closed and remaining_weight > 0.01:
             last_j = min(bar_idx + 200, len(df)) - 1
-            exit_price = df.iloc[last_j]["close"]
+            weighted_exit += remaining_weight * df.iloc[last_j]["close"]
             exit_reason = "TIMEOUT"
             exit_bar = last_j
+        else:
+            exit_reason = "SL" if not closed and remaining_weight <= 0.01 else ("TP3" if remaining_weight <= 0.01 else "SL")
+            if closed:
+                # Determine if last action was SL or TP
+                if is_long:
+                    if l <= entry * (1 - SL_PCT / 100):
+                        exit_reason = "SL"
+                    else:
+                        exit_reason = f"TP{tp_idx}" if tp_idx > 0 else "TP1"
+                else:
+                    if h >= entry * (1 + SL_PCT / 100):
+                        exit_reason = "SL"
+                    else:
+                        exit_reason = f"TP{tp_idx}" if tp_idx > 0 else "TP1"
+            exit_bar = j if closed else last_j
 
-        # Calculate PnL
         if is_long:
-            pnl_pct = (exit_price - entry_price) / entry_price * 100
+            pnl_pct = (weighted_exit - entry) / entry * 100
         else:
-            pnl_pct = (entry_price - exit_price) / entry_price * 100
+            pnl_pct = (entry - weighted_exit) / entry * 100
 
-        # Risk amount based on SL
         risk_amount = INITIAL_BALANCE * (RISK_PER_TRADE_PCT / 100)
-        if is_scalp:
-            risk_amount = INITIAL_BALANCE * (1.0 / 100)  # 1% risk for scalp
-
-        # Position size (how many $ worth)
-        if is_scalp:
-            pos_size = risk_amount / (sl_pct / 100)
-        else:
-            pos_size = risk_amount / (SL_PCT / 100)
-
+        pos_size = risk_amount / (SL_PCT / 100)
         pnl_dollar = pos_size * (pnl_pct / 100)
 
-        # Bars held
-        bars_held = exit_bar - bar_idx if exit_bar else 0
-
         results.append({
-            "time": t["time"],
-            "symbol": t["symbol"],
-            "system": t["system"],
-            "type": t["type"],
-            "is_scalp": t["is_scalp"],
-            "entry": entry_price,
-            "exit": exit_price,
-            "pnl_pct": round(pnl_pct, 3),
-            "pnl_dollar": round(pnl_dollar, 2),
+            "time": t["time"], "symbol": t["symbol"],
+            "type": t["type"], "entry": entry,
+            "confluence": t["confluence"], "strength": t["strength"],
+            "pnl_pct": round(pnl_pct, 3), "pnl_dollar": round(pnl_dollar, 2),
             "exit_reason": exit_reason,
-            "bars_held": bars_held,
         })
 
     return results
 
 
-def calculate_stats(trades):
-    """Calculate comprehensive backtest statistics"""
-    if not trades:
+def calculate_stats(trades_df):
+    if trades_df.empty:
         return None
 
-    df = pd.DataFrame(trades)
-    df = df.sort_values("time").reset_index(drop=True)
-
-    total_trades = len(df)
-    wins = df[df["pnl_dollar"] > 0]
-    losses = df[df["pnl_dollar"] <= 0]
-    win_count = len(wins)
-    loss_count = len(losses)
-    win_rate = (win_count / total_trades * 100) if total_trades > 0 else 0
-
-    total_pnl = df["pnl_dollar"].sum()
-    avg_win = wins["pnl_dollar"].mean() if len(wins) > 0 else 0
-    avg_loss = losses["pnl_dollar"].mean() if len(losses) > 0 else 0
-    avg_trade = df["pnl_dollar"].mean()
-
-    # Profit Factor
+    total = len(trades_df)
+    wins = trades_df[trades_df["pnl_dollar"] > 0]
+    losses = trades_df[trades_df["pnl_dollar"] <= 0]
     gross_profit = wins["pnl_dollar"].sum()
     gross_loss = abs(losses["pnl_dollar"].sum())
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+    total_pnl = trades_df["pnl_dollar"].sum()
 
-    # Max drawdown (running balance)
-    running_balance = INITIAL_BALANCE + df["pnl_dollar"].cumsum()
-    peak = running_balance.cummax()
-    drawdown = (running_balance - peak) / peak * 100
-    max_dd = drawdown.min()
-    max_dd_pct = abs(max_dd)
+    running = INITIAL_BALANCE + trades_df["pnl_dollar"].cumsum()
+    peak = running.cummax()
+    max_dd = abs(((running - peak) / peak * 100).min())
 
-    # Final balance
-    final_balance = INITIAL_BALANCE + total_pnl
-    return_pct = (total_pnl / INITIAL_BALANCE) * 100
-
-    # Avg bars held
-    avg_bars = df["bars_held"].mean()
-
-    # Exit reason breakdown
-    exit_counts = df["exit_reason"].value_counts().to_dict()
-
-    # Per-system stats
-    system_stats = {}
-    for sys_name in df["system"].unique():
-        sub = df[df["system"] == sys_name]
-        sub_wins = sub[sub["pnl_dollar"] > 0]
-        sub_profit = sub["pnl_dollar"].sum()
-        sub_wr = (len(sub_wins) / len(sub) * 100) if len(sub) > 0 else 0
-        system_stats[sys_name] = {
+    # Per strength
+    strength_stats = {}
+    for s in sorted(trades_df["strength"].unique()):
+        sub = trades_df[trades_df["strength"] == s]
+        sw = sub[sub["pnl_dollar"] > 0]
+        strength_stats[s] = {
             "trades": len(sub),
-            "wins": len(sub_wins),
-            "pnl": round(sub_profit, 2),
-            "win_rate": round(sub_wr, 1),
-            "avg_pnl": round(sub["pnl_dollar"].mean(), 2),
+            "wr": round(len(sw) / len(sub) * 100, 1) if len(sub) > 0 else 0,
+            "pnl": round(sub["pnl_dollar"].sum(), 2),
         }
 
-    # Per-symbol stats
-    symbol_stats = {}
-    for sym in df["symbol"].unique():
-        sub = df[df["symbol"] == sym]
-        sub_wins = sub[sub["pnl_dollar"] > 0]
-        sub_profit = sub["pnl_dollar"].sum()
-        sub_wr = (len(sub_wins) / len(sub) * 100) if len(sub) > 0 else 0
-        symbol_stats[sym] = {
+    # Per pair
+    pair_stats = {}
+    for sym in trades_df["symbol"].unique():
+        sub = trades_df[trades_df["symbol"] == sym]
+        sw = sub[sub["pnl_dollar"] > 0]
+        pair_stats[sym] = {
             "trades": len(sub),
-            "pnl": round(sub_profit, 2),
-            "win_rate": round(sub_wr, 1),
+            "wr": round(len(sw) / len(sub) * 100, 1) if len(sub) > 0 else 0,
+            "pnl": round(sub["pnl_dollar"].sum(), 2),
         }
 
-    # Scalp vs Normal
-    scalp_trades = df[df["is_scalp"] == True]
-    normal_trades = df[df["is_scalp"] == False]
+    # Per confluence combo
+    conf_stats = {}
+    for _, row in trades_df.iterrows():
+        key = " + ".join(sorted(row["confluence"]))
+        if key not in conf_stats:
+            conf_stats[key] = {"trades": 0, "wins": 0, "pnl": 0.0}
+        conf_stats[key]["trades"] += 1
+        if row["pnl_dollar"] > 0:
+            conf_stats[key]["wins"] += 1
+        conf_stats[key]["pnl"] += row["pnl_dollar"]
+    for k in conf_stats:
+        conf_stats[k]["wr"] = round(conf_stats[k]["wins"] / conf_stats[k]["trades"] * 100, 1)
+        conf_stats[k]["pnl"] = round(conf_stats[k]["pnl"], 2)
 
     return {
-        "total_trades": total_trades,
-        "win_count": win_count,
-        "loss_count": loss_count,
-        "win_rate": round(win_rate, 1),
+        "total_trades": total,
+        "win_rate": round(len(wins) / total * 100, 1) if total > 0 else 0,
+        "profit_factor": round(gross_profit / gross_loss, 2) if gross_loss > 0 else 999,
         "total_pnl": round(total_pnl, 2),
-        "gross_profit": round(gross_profit, 2),
-        "gross_loss": round(gross_loss, 2),
-        "profit_factor": round(profit_factor, 2),
-        "avg_win": round(avg_win, 2),
-        "avg_loss": round(avg_loss, 2),
-        "avg_trade": round(avg_trade, 2),
-        "max_dd_pct": round(max_dd_pct, 2),
-        "final_balance": round(final_balance, 2),
-        "return_pct": round(return_pct, 2),
-        "avg_bars": round(avg_bars, 1),
-        "exit_counts": exit_counts,
-        "system_stats": system_stats,
-        "symbol_stats": symbol_stats,
-        "scalp_trades": len(scalp_trades),
-        "scalp_pnl": round(scalp_trades["pnl_dollar"].sum(), 2) if len(scalp_trades) > 0 else 0,
-        "scalp_wr": round((len(scalp_trades[scalp_trades["pnl_dollar"] > 0]) / len(scalp_trades) * 100), 1) if len(scalp_trades) > 0 else 0,
-        "normal_trades": len(normal_trades),
-        "normal_pnl": round(normal_trades["pnl_dollar"].sum(), 2) if len(normal_trades) > 0 else 0,
-        "normal_wr": round((len(normal_trades[normal_trades["pnl_dollar"] > 0]) / len(normal_trades) * 100), 1) if len(normal_trades) > 0 else 0,
+        "return_pct": round(total_pnl / INITIAL_BALANCE * 100, 2),
+        "max_dd": round(max_dd, 2),
+        "final_balance": round(INITIAL_BALANCE + total_pnl, 2),
+        "avg_win": round(wins["pnl_dollar"].mean(), 2) if len(wins) > 0 else 0,
+        "avg_loss": round(losses["pnl_dollar"].mean(), 2) if len(losses) > 0 else 0,
+        "strength_stats": strength_stats,
+        "pair_stats": pair_stats,
+        "conf_stats": conf_stats,
     }
 
 
 def send_telegram(text):
     if not BOT_TOKEN or not CHANNEL_ID:
-        logger.warning("BOT_TOKEN or CHANNEL_ID not set — skipping Telegram")
         return False
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHANNEL_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     try:
-        r = requests.post(url, json=payload, timeout=10)
-        if r.json().get("ok"):
-            return True
-        logger.error(f"TG error: {r.json()}")
-    except Exception as e:
-        logger.error(f"TG send error: {e}")
-    return False
+        r = requests.post(url, json={"chat_id": CHANNEL_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
+        return r.json().get("ok", False)
+    except:
+        return False
 
 
-def build_telegram_message(stats, backtest_period):
-    """Build the Telegram result message"""
-    # Main stats
+def build_message(stats, period):
     msg = (
-        f"📊 <b>OTS 4H Trading System V1.2 — Backtest Report</b>\n"
+        f"📊 <b>OTS Precision V2.0 — Backtest Report</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📅 Period: {backtest_period}\n"
-        f" pairs: {', '.join(SYMBOLS)}\n"
-        f"Timeframe: 4H\n"
+        f"📅 Period: {period}\n"
+        f"Pairs: {', '.join(SYMBOLS)}\n"
+        f"Timeframe: 1H | Filters: Daily Trend + ADX>{ADX_MIN} + Confluence\n"
         f"Capital: ${INITIAL_BALANCE:,.0f} | Risk: {RISK_PER_TRADE_PCT}%/trade\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     )
 
     msg += (
-        f"📈 <b>OVERALL RESULTS</b>\n"
+        f"📈 <b>OVERALL</b>\n"
         f"Total Trades: <b>{stats['total_trades']}</b>\n"
-        f"  Normal: {stats['normal_trades']} | Scalp: {stats['scalp_trades']}\n"
-        f"Wins: {stats['win_count']} | Losses: {stats['loss_count']}\n"
         f"Win Rate: <b>{stats['win_rate']}%</b>\n"
-        f"  Normal WR: {stats['normal_wr']}% | Scalp WR: {stats['scalp_wr']}%\n"
-        f"Profit Factor: <b>{stats['profit_factor']}</b>\n\n"
-    )
-
-    msg += (
-        f"💰 <b>PROFIT & LOSS</b>\n"
+        f"Profit Factor: <b>{stats['profit_factor']}</b>\n"
         f"Total PnL: <b>${stats['total_pnl']:,.2f}</b>\n"
-        f"  Normal PnL: ${stats['normal_pnl']:,.2f}\n"
-        f"  Scalp PnL: ${stats['scalp_pnl']:,.2f}\n"
-        f"Gross Profit: ${stats['gross_profit']:,.2f}\n"
-        f"Gross Loss: ${stats['gross_loss']:,.2f}\n"
-        f"Avg Win: ${stats['avg_win']:,.2f} | Avg Loss: ${stats['avg_loss']:,.2f}\n"
-        f"Avg Trade: ${stats['avg_trade']:,.2f}\n\n"
-    )
-
-    msg += (
-        f"📉 <b>RISK METRICS</b>\n"
-        f"Max Drawdown: <b>{stats['max_dd_pct']}%</b>\n"
         f"Return: <b>{stats['return_pct']}%</b>\n"
-        f"Final Balance: <b>${stats['final_balance']:,.2f}</b>\n"
-        f"Avg Bars Held: {stats['avg_bars']}\n\n"
+        f"Max Drawdown: <b>{stats['max_dd']}%</b>\n"
+        f"Final Balance: <b>${stats['final_balance']:,.2f}</b>\n\n"
     )
 
-    # System breakdown
-    msg += f"🧩 <b>SYSTEM BREAKDOWN</b>\n"
-    for sys_name, ss in sorted(stats["system_stats"].items(), key=lambda x: x[1]["pnl"], reverse=True):
+    msg += f"💪 <b>STRENGTH (Confluence Count)</b>\n"
+    for s, ss in sorted(stats["strength_stats"].items()):
         emoji = "🟢" if ss["pnl"] > 0 else "🔻"
-        msg += (
-            f"  {emoji} {sys_name}: {ss['trades']} trades | "
-            f"WR {ss['win_rate']}% | PnL ${ss['pnl']:,.2f}\n"
-        )
+        msg += f"  {emoji} {s}/3 confluence: {ss['trades']} trades | WR {ss['wr']}% | PnL ${ss['pnl']:,.2f}\n"
 
-    # Symbol breakdown
     msg += f"\n📊 <b>PAIR BREAKDOWN</b>\n"
-    for sym, ss in sorted(stats["symbol_stats"].items(), key=lambda x: x[1]["pnl"], reverse=True):
-        emoji = "🟢" if ss["pnl"] > 0 else "🔻"
-        msg += (
-            f"  {emoji} {sym}: {ss['trades']} trades | "
-            f"WR {ss['win_rate']}% | PnL ${ss['pnl']:,.2f}\n"
-        )
+    for sym, ps in sorted(stats["pair_stats"].items(), key=lambda x: x[1]["pnl"], reverse=True):
+        emoji = "🟢" if ps["pnl"] > 0 else "🔻"
+        msg += f"  {emoji} {sym}: {ps['trades']} trades | WR {ps['wr']}% | PnL ${ps['pnl']:,.2f}\n"
 
-    # Exit reasons
-    msg += f"\n🏁 <b>EXIT REASONS</b>\n"
-    for reason, count in stats["exit_counts"].items():
-        msg += f"  {reason}: {count}\n"
+    msg += f"\n🧩 <b>CONFLUENCE COMBOS</b>\n"
+    for combo, cs in sorted(stats["conf_stats"].items(), key=lambda x: x[1]["pnl"], reverse=True):
+        emoji = "🟢" if cs["pnl"] > 0 else "🔻"
+        msg += f"  {emoji} {combo}: {cs['trades']} trades | WR {cs['wr']}% | PnL ${cs['pnl']:,.2f}\n"
 
     return msg
 
 
 def main():
-    start_time = time.time()
-    logger.info(f"=== OTS 4H Backtest — {BACKTEST_MONTHS} months ===")
-    logger.info(f"Pairs: {SYMBOLS}")
-    logger.info(f"Capital: ${INITIAL_BALANCE:,.0f}")
+    start = time.time()
+    logger.info(f"=== OTS Precision V2.0 Backtest — {BACKTEST_MONTHS} months ===")
 
     exchange = ccxt.__dict__.get(EXCHANGE_NAME, ccxt.mexc)()
     exchange.enableRateLimit = True
 
-    all_trades = []
-
+    all_results = []
     for symbol in SYMBOLS:
-        logger.info(f"\n--- Processing {symbol} ---")
-        try:
-            df_full, df_trade = fetch_data(exchange, symbol)
-        except Exception as e:
-            logger.error(f"  Failed to fetch {symbol}: {e}")
+        logger.info(f"\n--- {symbol} ---")
+        result = run_backtest_symbol(exchange, symbol)
+        if result is None:
             continue
+        trades, df = result
+        logger.info(f"  Precision signals: {len(trades)}")
+        simulated = simulate_trades(trades, df)
+        all_results.extend(simulated)
+        logger.info(f"  Simulated: {len(simulated)}")
 
-        logger.info(f"  Full data: {len(df_full)} bars | Trade window: {len(df_trade)} bars")
-        logger.info(f"  Trade window: {df_trade.index[0]} to {df_trade.index[-1]}")
-
-        trades, df = run_backtest_on_symbol(df_full, df_trade, symbol)
-        logger.info(f"  Signals found: {len(trades)}")
-
-        results = simulate_trades(trades, df)
-        all_trades.extend(results)
-        logger.info(f"  Simulated trades: {len(results)}")
-
-    if not all_trades:
-        logger.error("No trades generated!")
-        send_telegram("⚠️ OTS Backtest: No trades generated. Check data or parameters.")
+    if not all_results:
+        logger.error("No trades!")
+        send_telegram("⚠️ Precision V2.0 Backtest: No trades generated.")
         return
 
-    stats = calculate_stats(all_trades)
-    elapsed = time.time() - start_time
+    df_trades = pd.DataFrame(all_results).sort_values("time").reset_index(drop=True)
+    stats = calculate_stats(df_trades)
 
-    # Build period string
-    df_trades = pd.DataFrame(all_trades)
-    period_start = df_trades["time"].min().strftime("%Y-%m-%d")
-    period_end = df_trades["time"].max().strftime("%Y-%m-%d")
-    backtest_period = f"{period_start} → {period_end}"
+    period = f"{df_trades['time'].min().strftime('%Y-%m-%d')} → {df_trades['time'].max().strftime('%Y-%m-%d')}"
 
-    # Print results
     logger.info(f"\n{'='*50}")
-    logger.info(f"BACKTEST RESULTS — {backtest_period}")
+    logger.info(f"PRECISION V2.0 RESULTS — {period}")
     logger.info(f"{'='*50}")
-    logger.info(f"Total Trades: {stats['total_trades']}")
-    logger.info(f"Win Rate: {stats['win_rate']}%")
-    logger.info(f"Profit Factor: {stats['profit_factor']}")
-    logger.info(f"Total PnL: ${stats['total_pnl']:,.2f}")
-    logger.info(f"Return: {stats['return_pct']}%")
-    logger.info(f"Max Drawdown: {stats['max_dd_pct']}%")
-    logger.info(f"Final Balance: ${stats['final_balance']:,.2f}")
-    logger.info(f"\nPer System:")
-    for sys_name, ss in sorted(stats["system_stats"].items(), key=lambda x: x[1]["pnl"], reverse=True):
-        logger.info(f"  {sys_name}: {ss['trades']} trades, WR {ss['win_rate']}%, PnL ${ss['pnl']:,.2f}")
-    logger.info(f"\nPer Pair:")
-    for sym, ss in sorted(stats["symbol_stats"].items(), key=lambda x: x[1]["pnl"], reverse=True):
-        logger.info(f"  {sym}: {ss['trades']} trades, WR {ss['win_rate']}%, PnL ${ss['pnl']:,.2f}")
-    logger.info(f"\nScalp: {stats['scalp_trades']} trades, WR {stats['scalp_wr']}%, PnL ${stats['scalp_pnl']:,.2f}")
-    logger.info(f"Normal: {stats['normal_trades']} trades, WR {stats['normal_wr']}%, PnL ${stats['normal_pnl']:,.2f}")
-    logger.info(f"\nElapsed: {elapsed:.1f}s")
+    logger.info(f"Trades: {stats['total_trades']} | WR: {stats['win_rate']}% | PF: {stats['profit_factor']}")
+    logger.info(f"PnL: ${stats['total_pnl']:,.2f} ({stats['return_pct']}%) | DD: {stats['max_dd']}%")
+    for s, ss in sorted(stats["strength_stats"].items()):
+        logger.info(f"  Strength {s}/3: {ss['trades']} trades, WR {ss['wr']}%, PnL ${ss['pnl']:,.2f}")
+    for combo, cs in sorted(stats["conf_stats"].items(), key=lambda x: x[1]["pnl"], reverse=True):
+        logger.info(f"  {combo}: {cs['trades']} trades, WR {cs['wr']}%, PnL ${cs['pnl']:,.2f}")
 
-    # Send to Telegram
-    msg = build_telegram_message(stats, backtest_period)
-    msg += f"\n⏱ Completed in {elapsed:.0f}s"
+    msg = build_message(stats, period)
+    msg += f"\n⏱ {time.time() - start:.0f}s"
 
-    sent = send_telegram(msg)
-    if sent:
+    if send_telegram(msg):
         logger.info("Results sent to Telegram!")
     else:
-        logger.warning("Failed to send to Telegram. Check BOT_TOKEN and CHANNEL_ID.")
-        # Print message so user can see it anyway
-        print("\n" + "="*50)
-        print("TELEGRAM MESSAGE (not sent):")
-        print("="*50)
-        print(msg)
+        logger.warning("Telegram not sent.")
+        print("\n" + msg)
 
 
 if __name__ == "__main__":
