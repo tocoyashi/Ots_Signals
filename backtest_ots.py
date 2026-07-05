@@ -23,7 +23,11 @@ logger = logging.getLogger("OTS-Backtest")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
 EXCHANGE_NAME = os.environ.get("EXCHANGE_NAME", "mexc")
-SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
+SYMBOLS = [
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT",
+    "DOGE/USDT", "ADA/USDT", "LINK/USDT",
+    "DOT/USDT", "LTC/USDT", "SHIB/USDT",
+]
 TIMEFRAME = "4h"
 INITIAL_BALANCE = 10000.0
 RISK_PER_TRADE_PCT = 2.0  # 2% of balance per trade
@@ -37,15 +41,6 @@ RSI_COOLDOWN = 20
 RSI_MAX_DISTANCE = 2.2
 RSI_MAX_CANDLE = 2.0
 
-# KDJ SYSTEM
-KDJ_PERIOD = 9
-KDJ_LOOKBACK = 100
-KDJ_HMA_LEN = 50
-KDJ_MIN_CANDLE = 0.5
-KDJ_MAX_CANDLE = 2.0
-KDJ_MAX_DIST_EMA = 2.0
-KDJ_COOLDOWN = 20
-
 # S/R SYSTEM
 SR_PIVOT_LEN = 10
 SR_MIN_DISTANCE = 0.5
@@ -53,17 +48,13 @@ SR_MAX_DIST_EMA = 2.0
 SR_MAX_CANDLE = 2.0
 SR_COOLDOWN = 15
 
-# OTS SYSTEM
-OTS_ALPHA = 20
-OTS_DELTA = 17
-
-# VOLUME SYSTEM
+# VOLUME SYSTEM (relaxed for more signals)
 VOL_LENGTH = 14
-VOL_MULTIPLIER = 3.4
-VOL_COOLDOWN = 30
-VOL_DISTANCE_PERCENT = 3.0
+VOL_MULTIPLIER = 3.0
+VOL_COOLDOWN = 20
+VOL_DISTANCE_PERCENT = 4.0
 
-# PRESSURE SYSTEM
+# PRESSURE SYSTEM (strict — high quality signals)
 PRESSURE_RSI_PERIOD = 50
 PRESSURE_RATE = 45
 PRESSURE_THRESHOLD = 500
@@ -347,8 +338,8 @@ def run_backtest_on_symbol(df_full, df_trade, symbol):
 
     # Get all signals
     all_systems = [
-        rsi_system(df), kdj_system(df), sr_system(df),
-        ots_system(df), vol_system(df), pressure_system(df),
+        rsi_system(df), sr_system(df),
+        vol_system(df), pressure_system(df),
     ]
     scalp_buy, scalp_sell, _ = scalp_system(df)
 
