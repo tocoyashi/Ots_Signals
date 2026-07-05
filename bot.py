@@ -10,13 +10,21 @@ pd.set_option('future.no_silent_downcasting', True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("OTS-Bot")
 
+# ═══════════════════════════════════════════
+#  CONFIG FROM GITHUB SECRETS
+# ═══════════════════════════════════════════
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
 EXCHANGE_NAME = os.environ.get("EXCHANGE_NAME", "mexc")
-SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
+SYMBOLS = [
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT",
+    "DOGE/USDT", "ADA/USDT", "LINK/USDT",
+    "DOT/USDT", "LTC/USDT", "SHIB/USDT",
+]
 TIMEFRAME = "4h"
 LOOKBACK = 1000
 
+# RSI SYSTEM
 RSI_LENGTH = 14
 RSI_UPPER = 65.0
 RSI_LOWER = 35.0
@@ -24,43 +32,35 @@ RSI_COOLDOWN = 20
 RSI_MAX_DISTANCE = 2.2
 RSI_MAX_CANDLE = 2.0
 
-KDJ_PERIOD = 9
-KDJ_LOOKBACK = 100
-KDJ_HMA_LEN = 50
-KDJ_MIN_CANDLE = 0.5
-KDJ_MAX_CANDLE = 2.0
-KDJ_MAX_DIST_EMA = 2.0
-KDJ_COOLDOWN = 20
-
+# S/R SYSTEM
 SR_PIVOT_LEN = 10
 SR_MIN_DISTANCE = 0.5
 SR_MAX_DIST_EMA = 2.0
 SR_MAX_CANDLE = 2.0
 SR_COOLDOWN = 15
 
-OTS_ALPHA = 20
-OTS_DELTA = 17
-
+# VOLUME SYSTEM (relaxed for more signals)
 VOL_LENGTH = 14
-VOL_MULTIPLIER = 3.4
-VOL_COOLDOWN = 30
-VOL_DISTANCE_PERCENT = 3.0
+VOL_MULTIPLIER = 3.0
+VOL_COOLDOWN = 20
+VOL_DISTANCE_PERCENT = 4.0
 
+# PRESSURE SYSTEM (strict — high quality signals)
 PRESSURE_RSI_PERIOD = 50
 PRESSURE_RATE = 45
 PRESSURE_THRESHOLD = 500
 PRESSURE_EMA_DIST = 5.0
 
+# TP/SL
 SL_PCT = 3.5
 TP1_PCT = 1.0
 TP2_PCT = 3.0
 TP3_PCT = 6.0
 
-SCALP_COOLDOWN = 10
-SCALP_EMA_FAR = 1.5
-SCALP_MAX_EMA200 = 3.0
-SCALP_SL_PCT = 2.0
-SCALP_TP_PCT = 0.85
+
+# ═══════════════════════════════════════════
+#  INDICATOR FUNCTIONS
+# ═══════════════════════════════════════════
 
 def rma(s, length):
     return s.ewm(alpha=1 / length, adjust=False).mean()
@@ -121,6 +121,11 @@ def pivotlow(low, left, right):
             result.iloc[i + right] = low.iloc[i]
     return result
 
+
+# ═══════════════════════════════════════════
+#  SYSTEM 1: RSI + EMA 150 + EMA 500
+# ═══════════════════════════════════════════
+
 def rsi_system(df):
     rsi = df["rsi"]
     close = df["close"]
@@ -142,6 +147,11 @@ def rsi_system(df):
     buy = buy_cross & (close > e150) & near & valid_c & e150_above
     sell = sell_cross & (close < e150) & near & valid_c & e150_below
     return apply_cooldown(buy, RSI_COOLDOWN), apply_cooldown(sell, RSI_COOLDOWN), "RSI"
+
+
+# ═══════════════════════════════════════════
+#  SYSTEM 2: KDJ + HMA 50
+# ═══════════════════════════════════════════
 
 def kdj_system(df):
     close = df["close"]
@@ -173,6 +183,11 @@ def kdj_system(df):
     sell = cross_down & (close < e200) & hma_down & valid_c & valid_d
     return apply_cooldown(buy, KDJ_COOLDOWN), apply_cooldown(sell, KDJ_COOLDOWN), "KDJ"
 
+
+# ═══════════════════════════════════════════
+#  SYSTEM 3: S/R Filter + EMA 200
+# ═══════════════════════════════════════════
+
 def sr_system(df):
     rsi = df["rsi"]
     close = df["close"]
@@ -191,6 +206,11 @@ def sr_system(df):
     buy = buy_base & (close > e200) & near & valid_c
     sell = sell_base & (close < e200) & near & valid_c
     return apply_cooldown(buy, SR_COOLDOWN), apply_cooldown(sell, SR_COOLDOWN), "S/R"
+
+
+# ═══════════════════════════════════════════
+#  SYSTEM 4: OTS Exhaustion (Lelec)
+# ═══════════════════════════════════════════
 
 def ots_system(df):
     close = df["close"].values
@@ -219,6 +239,11 @@ def ots_system(df):
     sell = (lelec == -1) & (df["close"] < e250)
     return buy, sell, "OTS"
 
+
+# ═══════════════════════════════════════════
+#  SYSTEM 5: Volume Spike
+# ═══════════════════════════════════════════
+
 def vol_system(df):
     close = df["close"]
     open_ = df["open"]
@@ -240,6 +265,11 @@ def vol_system(df):
     buy = buy & (dp >= 0) & (dp <= VOL_DISTANCE_PERCENT)
     sell = sell & (dp <= 0) & (dp >= -VOL_DISTANCE_PERCENT)
     return apply_cooldown(buy, VOL_COOLDOWN), apply_cooldown(sell, VOL_COOLDOWN), "VOL"
+
+
+# ═══════════════════════════════════════════
+#  SYSTEM 6: Pressure Tracker
+# ═══════════════════════════════════════════
 
 def pressure_system(df):
     close = df["close"]
@@ -277,6 +307,11 @@ def pressure_system(df):
     sell = (rsim_down < 0) & (rsim_down.shift(1).fillna(0) == 0) & (diff < -PRESSURE_THRESHOLD) & (dp > PRESSURE_EMA_DIST) & ~is_up_rsi
     return buy, sell, "Pressure"
 
+
+# ═══════════════════════════════════════════
+#  SYSTEM 7: SCALPING (Tiny Triangles)
+# ═══════════════════════════════════════════
+
 SCALP_COOLDOWN = 10
 SCALP_EMA_FAR = 1.5
 SCALP_MAX_EMA200 = 3.0
@@ -304,9 +339,14 @@ def scalp_system(df):
     sell = sell_cross & (close < e150) & ~is_far & near
     return apply_cooldown(buy, SCALP_COOLDOWN), apply_cooldown(sell, SCALP_COOLDOWN), "Scalp"
 
+
+# ═══════════════════════════════════════════
+#  TELEGRAM
+# ═══════════════════════════════════════════
+
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHANNEL_ID, "text": text, "disable_web_page_preview": True, "parse_mode": "HTML"}
+    payload = {"chat_id": CHANNEL_ID, "text": text, "disable_web_page_preview": True}
     try:
         r = requests.post(url, json=payload, timeout=10)
         if r.json().get("ok"):
@@ -315,6 +355,7 @@ def send_telegram(text):
     except Exception as e:
         logger.error(f"TG send error: {e}")
     return False
+
 
 def send_signal(sig_type, source, price, rsi_val, bar_time, symbol, is_scalp=False):
     if is_scalp:
@@ -371,6 +412,11 @@ def send_signal(sig_type, source, price, rsi_val, bar_time, symbol, is_scalp=Fal
         )
     return send_telegram(msg)
 
+
+# ═══════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════
+
 def analyze_symbol(exchange, symbol):
     logger.info(f"Scanning {symbol}...")
     try:
@@ -395,9 +441,7 @@ def analyze_symbol(exchange, symbol):
 
     systems = [
         rsi_system(df),
-        kdj_system(df),
         sr_system(df),
-        ots_system(df),
         vol_system(df),
         pressure_system(df),
     ]
@@ -424,6 +468,7 @@ def analyze_symbol(exchange, symbol):
         logger.info(f"SCALP SELL {symbol}")
         send_signal("SELL", "Scalp", round(price, 4), rsi_val, last_time, symbol, is_scalp=True)
 
+
 def analyze():
     logger.info(f"Starting OTS 4H Scan for {len(SYMBOLS)} pairs...")
 
@@ -435,6 +480,7 @@ def analyze():
         time.sleep(2)
 
     logger.info("Scan complete.")
+
 
 if __name__ == "__main__":
     analyze()
