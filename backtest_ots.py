@@ -24,11 +24,9 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
 EXCHANGE_NAME = os.environ.get("EXCHANGE_NAME", "mexc")
 SYMBOLS = [
-    "BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT",
-    "DOGE/USDT", "ADA/USDT", "LINK/USDT",
-    "DOT/USDT", "LTC/USDT", "SHIB/USDT",
+    "BTC/USDT", "ADA/USDT", "XRP/USDT",
 ]
-TIMEFRAME = "4h"
+TIMEFRAME = "1h"
 INITIAL_BALANCE = 10000.0
 RISK_PER_TRADE_PCT = 2.0  # 2% of balance per trade
 BACKTEST_MONTHS = 4
@@ -48,10 +46,10 @@ SR_MAX_DIST_EMA = 2.0
 SR_MAX_CANDLE = 2.0
 SR_COOLDOWN = 15
 
-# VOLUME SYSTEM (relaxed for more signals)
+# VOLUME SYSTEM (relaxed for 1H)
 VOL_LENGTH = 14
 VOL_MULTIPLIER = 3.0
-VOL_COOLDOWN = 20
+VOL_COOLDOWN = 10
 VOL_DISTANCE_PERCENT = 4.0
 
 # PRESSURE SYSTEM (strict — high quality signals)
@@ -341,8 +339,6 @@ def run_backtest_on_symbol(df_full, df_trade, symbol):
         rsi_system(df), sr_system(df),
         vol_system(df), pressure_system(df),
     ]
-    scalp_buy, scalp_sell, _ = scalp_system(df)
-
     # Build signal timeline (only in trade window)
     trade_start = df_trade.index[0]
     trade_end = df_trade.index[-1]
@@ -366,23 +362,6 @@ def run_backtest_on_symbol(df_full, df_trade, symbol):
                     "type": "SHORT", "entry": df.loc[idx, "close"],
                     "is_scalp": False
                 })
-
-    # Scalp signals
-    for idx in df.index:
-        if idx < trade_start or idx > trade_end:
-            continue
-        if scalp_buy.loc[idx]:
-            trades.append({
-                "time": idx, "symbol": symbol, "system": "Scalp",
-                "type": "LONG", "entry": df.loc[idx, "close"],
-                "is_scalp": True
-            })
-        if scalp_sell.loc[idx]:
-            trades.append({
-                "time": idx, "symbol": symbol, "system": "Scalp",
-                "type": "SHORT", "entry": df.loc[idx, "close"],
-                "is_scalp": True
-            })
 
     return trades, df
 
@@ -420,7 +399,7 @@ def simulate_trades(trades, df):
         exit_reason = ""
 
         if is_scalp:
-            for j in range(bar_idx + 1, min(bar_idx + 50, len(df))):
+            for j in range(bar_idx + 1, min(bar_idx + 200, len(df))):
                 h = df.iloc[j]["high"]
                 l = df.iloc[j]["low"]
                 if is_long:
@@ -444,7 +423,7 @@ def simulate_trades(trades, df):
             tp_idx = 0  # which TP level we're waiting for
             closed_completely = False
 
-            for j in range(bar_idx + 1, min(bar_idx + 50, len(df))):
+            for j in range(bar_idx + 1, min(bar_idx + 200, len(df))):
                 h = df.iloc[j]["high"]
                 l = df.iloc[j]["low"]
 
@@ -489,7 +468,7 @@ def simulate_trades(trades, df):
 
             if not closed_completely and remaining_weight > 0.01:
                 # Close remaining at last bar's close
-                last_j = min(bar_idx + 50, len(df)) - 1
+                last_j = min(bar_idx + 200, len(df)) - 1
                 weighted_exit += remaining_weight * df.iloc[last_j]["close"]
                 exit_price = weighted_exit
                 exit_reason = "TIMEOUT"
@@ -497,7 +476,7 @@ def simulate_trades(trades, df):
 
         # If no exit found within max bars, close at last available close
         if exit_price is None:
-            last_j = min(bar_idx + 50, len(df)) - 1
+            last_j = min(bar_idx + 200, len(df)) - 1
             exit_price = df.iloc[last_j]["close"]
             exit_reason = "TIMEOUT"
             exit_bar = last_j
