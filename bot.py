@@ -27,7 +27,6 @@ TP2_PERC = 1.5
 TP3_PERC = 2.4
 TP4_PERC = 5.0
 TP5_PERC = 7.0
-TP6_PERC = 9.0
 SL_PERC = 6.0
 
 # ================= Quality Filters (Backtested — F3+F4) =================
@@ -52,38 +51,48 @@ COOLDOWN_FILE = Path('cooldown.json')
 COOLDOWN_HOURS = 4
 
 
-def calculate_targets(entry_price, signal_type):
+def _fmt(price):
+    """Smart price formatting: fewer decimals for high prices"""
+    if price >= 1000:   return f"{price:,.2f}"
+    elif price >= 1:    return f"{price:,.4f}"
+    else:              return f"{price:,.6f}"
+
+def build_signal_message(symbol, signal_type, entry_price, entry_time):
     if signal_type == 1:
         tp1 = entry_price * (1 + TP1_PERC / 100)
         tp2 = entry_price * (1 + TP2_PERC / 100)
         tp3 = entry_price * (1 + TP3_PERC / 100)
         tp4 = entry_price * (1 + TP4_PERC / 100)
         tp5 = entry_price * (1 + TP5_PERC / 100)
-        tp6 = entry_price * (1 + TP6_PERC / 100)
         sl  = entry_price * (1 - SL_PERC / 100)
+        direction = "LONG"
     else:
         tp1 = entry_price * (1 - TP1_PERC / 100)
         tp2 = entry_price * (1 - TP2_PERC / 100)
         tp3 = entry_price * (1 - TP3_PERC / 100)
         tp4 = entry_price * (1 - TP4_PERC / 100)
         tp5 = entry_price * (1 - TP5_PERC / 100)
-        tp6 = entry_price * (1 - TP6_PERC / 100)
         sl  = entry_price * (1 + SL_PERC / 100)
+        direction = "SHORT"
 
-    p = 6
-    targets_text = f"""⭐ <b>Leverage:</b> {LEVERAGE}x
+    pair = symbol.replace('/', '')
+    msg = f"""🌤 New Trading Signals
 
-🎯 <b>Take Profits:</b>
-TP1: <code>{tp1:.{p}f}</code>
-TP2: <code>{tp2:.{p}f}</code>
-TP3: <code>{tp3:.{p}f}</code>
-TP4: <code>{tp4:.{p}f}</code>
-TP5: <code>{tp5:.{p}f}</code>
-TP6: <code>{tp6:.{p}f}</code> 🚀 Boom
+#{pair}  │ 15m │
+{direction}
+Entry: {_fmt(entry_price)}
+Leverage :  {LEVERAGE}x
 
-🛑 <b>Stop Loss:</b> <code>{sl:.{p}f}</code>"""
+TP1 ➜ {_fmt(tp1)}
+TP2 ➜ {_fmt(tp2)}
+TP3 ➜ {_fmt(tp3)}
+TP4 ➜ {_fmt(tp4)}
+TP5 ➜ {_fmt(tp5)}  ☀️☀️
 
-    return targets_text
+SL :  {_fmt(sl)}
+↻ After TP1 → BE"""
+
+    return msg
 
 
 def _fast_linreg_endpoint(series, window=20):
@@ -325,30 +334,8 @@ def main():
             if current_signal != 0:
                 signals_found += 1
                 cooldown_data[symbol] = datetime.now().isoformat()
-                targets_str = calculate_targets(current_price, current_signal)
 
-                if current_signal == 1:
-                    msg = f"""<b>BUY Signal (Long)</b>
-
-📊 Asset: <b>{symbol}</b>
-⏱️ Time: {current_time}
-💎 Entry Price: <code>{current_price:.6f}</code>
-📈 Strategy: Scalping
-
-{targets_str}
-
-⚠️ <i>Manage your risk</i>"""
-                else:
-                    msg = f"""<b>SELL Signal (Short)</b>
-
-📊 Asset: <b>{symbol}</b>
-⏱️ Time: {current_time}
-💎 Entry Price: <code>{current_price:.6f}</code>
-📉 Strategy: Scalping
-
-{targets_str}
-
-⚠️ <i>Manage your risk</i>"""
+                msg = build_signal_message(symbol, current_signal, current_price, current_time)
 
                 send_telegram_message(msg)
                 print(f"-> Signal sent for {symbol}: {'BUY' if current_signal == 1 else 'SELL'}")
