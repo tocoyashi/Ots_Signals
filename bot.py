@@ -11,7 +11,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ================= Secure Configuration (From GitHub Secrets) =================
-TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
 CHANNEL_ID = os.environ.get('CHANNEL_ID')
 
 # ================= Trading Settings =================
