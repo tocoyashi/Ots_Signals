@@ -11,7 +11,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ================= Secure Configuration (From GitHub Secrets) =================
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN') or os.environ.get('BOT_TOKEN')
 CHANNEL_ID = os.environ.get('CHANNEL_ID')
 
 # ================= Trading Settings =================
@@ -56,6 +56,7 @@ def _fmt(price):
     if price >= 1000:   return f"{price:,.2f}"
     elif price >= 1:    return f"{price:,.4f}"
     else:              return f"{price:,.6f}"
+
 
 def build_signal_message(symbol, signal_type, entry_price, entry_time):
     if signal_type == 1:
