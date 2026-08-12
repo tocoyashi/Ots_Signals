@@ -91,7 +91,9 @@ TP4 ➜ {_fmt(tp4)}
 TP5 ➜ {_fmt(tp5)}  ☀️☀️
 
 SL :  {_fmt(sl)}
-↻ After TP1 → BE"""
+↻ After TP1 → BE
+
+L E A K E D  B Y: @BULLS_SIGNALS"""
 
     return msg
 
