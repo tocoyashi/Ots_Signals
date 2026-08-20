@@ -27,30 +27,29 @@ TP4_PERC = 4.5
 TP5_PERC = 7.0
 SL_PERC = 6.0
 
-# ================= Filters =================
+# ================= Filters — نسخة متوازنة (إشارات أكثر) =================
 TREND_FILTER = True
-SQUEEZE_DURATION_FILTER = True
-MIN_SQUEEZE_BARS = 2
+SQUEEZE_DURATION_FILTER = False    # ← عطلناه: أي squeeze release يُقبل
+MIN_SQUEEZE_BARS = 1
 
 FILTER_MOMENTUM_STRENGTH = True
 FILTER_ATR_MINIMUM = True
-ATR_MIN_PERCENT = 0.2
+ATR_MIN_PERCENT = 0.15            # ← خففنا من 0.2 إلى 0.15
 
 RSI_FILTER = True
 RSI_PERIOD = 14
-RSI_LONG_MAX = 70
-RSI_SHORT_MIN = 30
+RSI_LONG_MAX = 75                 # ← رفعنا من 70 إلى 75
+RSI_SHORT_MIN = 25                # ← خفضنا من 30 إلى 25
 
 VOLUME_FILTER = True
-VOL_MIN_RATIO = 1.0
+VOL_MIN_RATIO = 0.8               # ← خفضنا من 1.0 إلى 0.8
 
 ADX_FILTER = True
 ADX_PERIOD = 14
-ADX_MIN = 15
+ADX_MIN = 12                      # ← خفضنا من 15 إلى 12
 
-# ⚡ وضع البديل: إذا لم يكن هناك Squeeze Release، نبحث عن Momentum Break
-ALLOW_MOMENTUM_BREAK = True      # ← تفعيل الوضع البديل
-MOM_BREAK_THRESHOLD = 1.5      # الزخم يجب أن يكون أقوى من 1.5× الانحراف
+ALLOW_MOMENTUM_BREAK = True
+MOM_BREAK_THRESHOLD = 1.0        # ← خفضنا من 1.5 إلى 1.0
 
 COOLDOWN_FILE = Path('cooldown.json')
 COOLDOWN_HOURS = 6
@@ -186,7 +185,6 @@ class SqueezeMomentumIndicator:
         mom_threshold = (mom_rolling_std * 0.5).fillna(0)
         momentum_strong = momentum.abs() > mom_threshold
         
-        # Momentum Break: زخم قوي جداً بدون انتظار squeeze
         mom_break_threshold = mom_rolling_std * MOM_BREAK_THRESHOLD
         mom_break_long = (momentum > mom_break_threshold) & (momentum > momentum.shift(1))
         mom_break_short = (momentum < -mom_break_threshold) & (momentum < momentum.shift(1))
@@ -225,23 +223,20 @@ class SqueezeMomentumIndicator:
         reason = "No signal"
         
         # ═══════════════════════════════════════════
-        # MODE A: Squeeze Release (الأصلي — أعلى دقة)
+        # MODE A: Squeeze Release (بدون شرط المدة)
         # ═══════════════════════════════════════════
         squeeze_release = (squeeze_on_safe.shift(1) == True) & (squeeze_on_safe == False)
         has_squeeze_release = squeeze_release.iloc[-2]
         
         if has_squeeze_release:
-            if SQUEEZE_DURATION_FILTER and latest['squeeze_duration'] < MIN_SQUEEZE_BARS:
-                reason = f"Squeeze release but duration {latest['squeeze_duration']:.0f} < {MIN_SQUEEZE_BARS}"
-            else:
-                is_long = latest['momentum'] > 0 and mom_inc_safe.iloc[-2]
-                is_short = latest['momentum'] < 0 and not mom_inc_safe.iloc[-2]
-                if is_long or is_short:
-                    signal_type = 1 if is_long else -1
-                    reason = "Squeeze Release"
+            is_long = latest['momentum'] > 0 and mom_inc_safe.iloc[-2]
+            is_short = latest['momentum'] < 0 and not mom_inc_safe.iloc[-2]
+            if is_long or is_short:
+                signal_type = 1 if is_long else -1
+                reason = "Squeeze Release"
         
         # ═══════════════════════════════════════════
-        # MODE B: Momentum Break (البديل — إشارات أكثر)
+        # MODE B: Momentum Break (أسهل)
         # ═══════════════════════════════════════════
         elif ALLOW_MOMENTUM_BREAK:
             if latest['mom_break_long'] and mom_inc_safe.iloc[-2]:
@@ -259,7 +254,7 @@ class SqueezeMomentumIndicator:
             return data, reason
         
         # ═══════════════════════════════════════════
-        # Apply Quality Filters (على كلا الوضعين)
+        # Apply Quality Filters (مخففة)
         # ═══════════════════════════════════════════
         
         # Momentum Strength
@@ -277,20 +272,20 @@ class SqueezeMomentumIndicator:
         if FILTER_ATR_MINIMUM and latest['atr_pct'] < ATR_MIN_PERCENT:
             return data, f"{reason} → ATR% {latest['atr_pct']:.3f} < {ATR_MIN_PERCENT}"
         
-        # RSI Filter
+        # RSI Filter (مخفف)
         if RSI_FILTER:
             if signal_type == 1 and latest['rsi'] > RSI_LONG_MAX:
                 return data, f"{reason} → RSI {latest['rsi']:.1f} > {RSI_LONG_MAX}"
             if signal_type == -1 and latest['rsi'] < RSI_SHORT_MIN:
                 return data, f"{reason} → RSI {latest['rsi']:.1f} < {RSI_SHORT_MIN}"
         
-        # Volume Filter
+        # Volume Filter (مخفف)
         if VOLUME_FILTER:
             vol_ratio = latest['volume'] / latest['vol_sma'] if latest['vol_sma'] > 0 else 0
             if vol_ratio < VOL_MIN_RATIO:
                 return data, f"{reason} → Volume {vol_ratio:.2f}x < {VOL_MIN_RATIO}x"
         
-        # ADX Filter
+        # ADX Filter (مخفف)
         if ADX_FILTER and latest['adx'] < ADX_MIN:
             return data, f"{reason} → ADX {latest['adx']:.1f} < {ADX_MIN}"
         
@@ -310,7 +305,7 @@ def get_mexc_data(symbol, timeframe, limit=150):
     return df
 
 
-def get_top_mexc_coins(limit=20):
+def get_top_mexc_coins(limit=50):
     print(f"Fetching top {limit} coins by volume from MEXC...")
     exchange = ccxt.mexc({'enableRateLimit': True})
     try:
@@ -369,10 +364,12 @@ def is_on_cooldown(symbol, cooldown_data):
 
 def main():
     print("=" * 60)
-    print(" PRECISION SQUEEZE BOT — Dual Mode")
+    print(" PRECISION SQUEEZE BOT — Balanced Filters")
     print(f" Timeframe: {TIMEFRAME} | SL: {SL_PERC}% | Leverage: {LEVERAGE}x")
     print(f" Mode A: Squeeze Release | Mode B: Momentum Break (threshold={MOM_BREAK_THRESHOLD})")
     print("=" * 60)
+    print(f"Filters: Trend={TREND_FILTER} | ATR>{ATR_MIN_PERCENT}% | RSI<{RSI_LONG_MAX}/>{RSI_SHORT_MIN} | Vol>{VOL_MIN_RATIO}x | ADX>{ADX_MIN}")
+    print("-" * 60)
     
     if not TELEGRAM_TOKEN or not CHANNEL_ID:
         print("Environment not configured.")
