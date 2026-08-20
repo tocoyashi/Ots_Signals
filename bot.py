@@ -10,13 +10,12 @@ from pathlib import Path
 import warnings
 warnings.filterwarnings('ignore')
 
-# ================= Secure Configuration =================
+# ================= Configuration =================
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN') or os.environ.get('BOT_TOKEN')
 CHANNEL_ID = os.environ.get('CHANNEL_ID')
 
-# ================= Trading Settings =================
 TIMEFRAME = '15m'
-TOP_N_COINS = 50
+TOP_N_COINS = 20
 STABLECOINS = ['USDC/USDT', 'TUSD/USDT', 'DAI/USDT', 'FDUSD/USDT', 'USDP/USDT', 'PYUSD/USDT']
 BLACKLIST = ['WXT/USDT', 'ANTFUN/USDT', 'UPC/USDT', 'RAIN/USDT', 'USD1/USDT', 'USDE/USDT']
 
@@ -26,34 +25,30 @@ TP2_PERC = 1.6
 TP3_PERC = 2.8
 TP4_PERC = 4.5
 TP5_PERC = 7.0
-
-# 🔒 SL ثابت 6% (كما في النسخة الأصلية)
 SL_PERC = 6.0
 
-# ================= Advanced Filters (لزيادة الدقة) =================
-TREND_FILTER = True
-TREND_EMA_PERIOD = 50
-
+# ================= Filters — نسخة متوازنة (مخففة) =================
+# غيّر True/False حسب تجربتك
+TREND_FILTER = True           # EMA50 — الاتجاه العام
 SQUEEZE_DURATION_FILTER = True
-MIN_SQUEEZE_BARS = 3
+MIN_SQUEEZE_BARS = 2          # ← خففنا من 3 إلى 2
 
 FILTER_MOMENTUM_STRENGTH = True
 FILTER_ATR_MINIMUM = True
-ATR_MIN_PERCENT = 0.3
+ATR_MIN_PERCENT = 0.2         # ← خففنا من 0.3 إلى 0.2
 
 RSI_FILTER = True
 RSI_PERIOD = 14
-RSI_LONG_MAX = 65
-RSI_SHORT_MIN = 35
+RSI_LONG_MAX = 70             # ← خففنا من 65 إلى 70
+RSI_SHORT_MIN = 30            # ← خففنا من 35 إلى 30
 
 VOLUME_FILTER = True
-VOL_MIN_RATIO = 1.2
+VOL_MIN_RATIO = 1.0           # ← خففنا من 1.2 إلى 1.0 (فوق المتوسط)
 
 ADX_FILTER = True
 ADX_PERIOD = 14
-ADX_MIN = 22
+ADX_MIN = 15                  # ← خففنا من 22 إلى 15
 
-# ================= Cooldown =================
 COOLDOWN_FILE = Path('cooldown.json')
 COOLDOWN_HOURS = 6
 
@@ -70,12 +65,10 @@ def calculate_adx(df, period=14):
     minus_dm = -low.diff()
     plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
     minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0)
-    
     tr1 = high - low
     tr2 = abs(high - close.shift(1))
     tr3 = abs(low - close.shift(1))
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    
     atr = tr.ewm(alpha=1/period, min_periods=period).mean()
     plus_di = 100 * plus_dm.ewm(alpha=1/period, min_periods=period).mean() / atr
     minus_di = 100 * minus_dm.ewm(alpha=1/period, min_periods=period).mean() / atr
@@ -131,14 +124,6 @@ TP5 ➜ {_fmt(tp5)} ({TP5_PERC}%)
 ⚖️ After TP1 → Move to Breakeven
 
 ━━━━━━━━━━━━━━━
-✅ Filters Passed:
-• Squeeze Release + Duration ≥{MIN_SQUEEZE_BARS}
-• Momentum Strength
-• Trend Confirmation (EMA{TREND_EMA_PERIOD})
-• Volume Spike >{VOL_MIN_RATIO}x
-• RSI Zone Check
-• ADX > {ADX_MIN}
-
 L E A K E D  B Y: @BULLS_SIGNALS"""
 
 
@@ -176,40 +161,33 @@ class SqueezeMomentumIndicator:
 
     def calculate_indicators(self, df):
         data = df.copy()
-        
         bb_basis = data['close'].rolling(window=self.bb_length).mean()
         bb_dev = self.bb_mult * data['close'].rolling(window=self.bb_length).std()
         upper_bb = bb_basis + bb_dev
         lower_bb = bb_basis - bb_dev
-        
         kc_ma = data['close'].rolling(window=self.kc_length).mean()
         tr = self.true_range(data['high'], data['low'], data['close'])
         range_ma = tr.rolling(window=self.kc_length).mean()
         upper_kc = kc_ma + range_ma * self.kc_mult
         lower_kc = kc_ma - range_ma * self.kc_mult
-        
         squeeze_on = (lower_bb > lower_kc) & (upper_bb < upper_kc)
-        
         highest_high = data['high'].rolling(window=self.kc_length).max()
         lowest_low = data['low'].rolling(window=self.kc_length).min()
         close_ma = data['close'].rolling(window=self.kc_length).mean()
         avg_val = ((highest_high + lowest_low) / 2 + close_ma) / 2
         momentum = _fast_linreg_endpoint(data['close'] - avg_val, self.kc_length)
         
-        # ── Advanced Filters ──
         squeeze_groups = (squeeze_on != squeeze_on.shift()).cumsum()
         squeeze_duration = squeeze_on.groupby(squeeze_groups).cumsum()
-        
         mom_rolling_std = momentum.rolling(window=100).std()
         mom_threshold = (mom_rolling_std * 0.5).fillna(0)
         momentum_strong = momentum.abs() > mom_threshold
         
         atr = tr.rolling(window=14).mean()
         atr_pct = (atr / data['close']) * 100
-        
         rsi = calculate_rsi(data['close'], RSI_PERIOD)
         vol_sma = data['volume'].rolling(window=20).mean()
-        ema_trend = data['close'].ewm(span=TREND_EMA_PERIOD, adjust=False).mean()
+        ema_trend = data['close'].ewm(span=50, adjust=False).mean()
         adx, plus_di, minus_di = calculate_adx(data, ADX_PERIOD)
         
         data['squeeze_on'] = squeeze_on
@@ -225,62 +203,70 @@ class SqueezeMomentumIndicator:
         data['adx'] = adx
         return data
 
-    def generate_signals(self, df):
+    def generate_signals(self, df, symbol=""):
         data = self.calculate_indicators(df)
         data['signal'] = 0
         
         squeeze_on_safe = data['squeeze_on'].fillna(False).astype(bool)
         mom_inc_safe = data['momentum_increasing'].fillna(False).astype(bool)
+        latest = data.iloc[-2]
         
-        # Squeeze Release + Duration
+        # ── Check Squeeze Release ──
         squeeze_release = (squeeze_on_safe.shift(1) == True) & (squeeze_on_safe == False)
+        if not squeeze_release.iloc[-2]:
+            return data, "No squeeze release"
+        
+        # ── Check Squeeze Duration ──
         if SQUEEZE_DURATION_FILTER:
-            valid_duration = data['squeeze_duration'].shift(1) >= MIN_SQUEEZE_BARS
-            squeeze_release = squeeze_release & valid_duration
+            if latest['squeeze_duration'] < MIN_SQUEEZE_BARS:
+                return data, f"Squeeze duration {latest['squeeze_duration']:.0f} < {MIN_SQUEEZE_BARS}"
         
-        # BUY: Release + Momentum صاعد + قوي
-        buy_cond = (
-            (squeeze_release == True) &
-            (data['momentum'] > 0) &
-            (mom_inc_safe == True) &
-            (data['momentum_strong'].fillna(False) == True)
-        )
+        # ── Base conditions ──
+        is_long = latest['momentum'] > 0 and mom_inc_safe.iloc[-2]
+        is_short = latest['momentum'] < 0 and not mom_inc_safe.iloc[-2]
         
-        # SELL: Release + Momentum هابط + قوي
-        sell_cond = (
-            (squeeze_release == True) &
-            (data['momentum'] < 0) &
-            (mom_inc_safe == False) &
-            (data['momentum_strong'].fillna(False) == True)
-        )
+        if not is_long and not is_short:
+            return data, f"Momentum={latest['momentum']:.4f}, Inc={mom_inc_safe.iloc[-2]}"
         
-        # Apply Filters
+        # ── Momentum Strength ──
+        if FILTER_MOMENTUM_STRENGTH:
+            if not latest['momentum_strong']:
+                return data, "Momentum too weak"
+        
+        # ── Trend Filter ──
         if TREND_FILTER:
-            buy_cond = buy_cond & (data['close'] > data['ema_trend'])
-            sell_cond = sell_cond & (data['close'] < data['ema_trend'])
+            if is_long and latest['close'] <= latest['ema_trend']:
+                return data, f"Price {latest['close']:.4f} below EMA50 {latest['ema_trend']:.4f}"
+            if is_short and latest['close'] >= latest['ema_trend']:
+                return data, f"Price {latest['close']:.4f} above EMA50 {latest['ema_trend']:.4f}"
         
+        # ── ATR Filter ──
         if FILTER_ATR_MINIMUM:
-            atr_ok = data['atr_pct'].fillna(0) > ATR_MIN_PERCENT
-            buy_cond = buy_cond & atr_ok
-            sell_cond = sell_cond & atr_ok
+            if latest['atr_pct'] < ATR_MIN_PERCENT:
+                return data, f"ATR% {latest['atr_pct']:.3f} < {ATR_MIN_PERCENT}"
         
+        # ── RSI Filter ──
         if RSI_FILTER:
-            buy_cond = buy_cond & (data['rsi'].fillna(50) < RSI_LONG_MAX)
-            sell_cond = sell_cond & (data['rsi'].fillna(50) > RSI_SHORT_MIN)
+            if is_long and latest['rsi'] > RSI_LONG_MAX:
+                return data, f"RSI {latest['rsi']:.1f} > {RSI_LONG_MAX}"
+            if is_short and latest['rsi'] < RSI_SHORT_MIN:
+                return data, f"RSI {latest['rsi']:.1f} < {RSI_SHORT_MIN}"
         
+        # ── Volume Filter ──
         if VOLUME_FILTER:
-            vol_ok = data['volume'] > data['vol_sma'] * VOL_MIN_RATIO
-            buy_cond = buy_cond & vol_ok
-            sell_cond = sell_cond & vol_ok
+            vol_ratio = latest['volume'] / latest['vol_sma'] if latest['vol_sma'] > 0 else 0
+            if vol_ratio < VOL_MIN_RATIO:
+                return data, f"Volume ratio {vol_ratio:.2f}x < {VOL_MIN_RATIO}x"
         
+        # ── ADX Filter ──
         if ADX_FILTER:
-            adx_ok = data['adx'].fillna(0) > ADX_MIN
-            buy_cond = buy_cond & adx_ok
-            sell_cond = sell_cond & adx_ok
+            if latest['adx'] < ADX_MIN:
+                return data, f"ADX {latest['adx']:.1f} < {ADX_MIN}"
         
-        data.loc[buy_cond, 'signal'] = 1
-        data.loc[sell_cond, 'signal'] = -1
-        return data
+        # ── PASSED ALL ──
+        signal = 1 if is_long else -1
+        data.iloc[-2, data.columns.get_loc('signal')] = signal
+        return data, "PASS"
 
 
 def get_mexc_data(symbol, timeframe, limit=150):
@@ -351,9 +337,13 @@ def is_on_cooldown(symbol, cooldown_data):
 
 def main():
     print("=" * 60)
-    print(" PRECISION SQUEEZE BOT — Fixed SL 6% Edition")
-    print(f" Timeframe: {TIMEFRAME} | Leverage: {LEVERAGE}x | SL: {SL_PERC}%")
+    print(" PRECISION SQUEEZE BOT — Balanced Filters")
+    print(f" Timeframe: {TIMEFRAME} | SL: {SL_PERC}% | Leverage: {LEVERAGE}x")
     print("=" * 60)
+    print(f"Active Filters: Trend={TREND_FILTER} | Dur≥{MIN_SQUEEZE_BARS} | "
+          f"MomStr={FILTER_MOMENTUM_STRENGTH} | ATR>{ATR_MIN_PERCENT}% | "
+          f"RSI<{RSI_LONG_MAX}/>{RSI_SHORT_MIN} | Vol>{VOL_MIN_RATIO}x | ADX>{ADX_MIN}")
+    print("-" * 60)
     
     if not TELEGRAM_TOKEN or not CHANNEL_ID:
         print("Environment not configured.")
@@ -365,25 +355,26 @@ def main():
 
     cooldown_data = load_cooldown()
     indicator = SqueezeMomentumIndicator()
-    stats = {'sent': 0, 'cooldown': 0, 'no_signal': 0}
+    stats = {'sent': 0, 'cooldown': 0, 'rejected': {}}
 
     for symbol in top_coins:
         try:
             if is_on_cooldown(symbol, cooldown_data):
                 stats['cooldown'] += 1
+                print(f"  ⏳ {symbol}: On cooldown")
                 continue
 
             time.sleep(0.5)
             df = get_mexc_data(symbol, TIMEFRAME, limit=150)
-            df_signals = indicator.generate_signals(df)
-            latest = df_signals.iloc[-2]
-            current_signal = latest['signal']
+            df_signals, reason = indicator.generate_signals(df, symbol)
+            current_signal = df_signals.iloc[-2]['signal']
             
             if current_signal == 0:
-                stats['no_signal'] += 1
+                stats['rejected'][symbol] = reason
+                print(f"  ❌ {symbol}: {reason}")
                 continue
             
-            entry_price = latest['close']
+            entry_price = df_signals.iloc[-2]['close']
             cooldown_data[symbol] = datetime.now().isoformat()
             stats['sent'] += 1
 
@@ -391,13 +382,21 @@ def main():
             send_telegram_message(msg)
             
             dir_str = "LONG" if current_signal == 1 else "SHORT"
-            print(f"  🎯 {symbol} {dir_str} | SL: {SL_PERC}%")
+            print(f"  ✅ {symbol}: {dir_str} SIGNAL SENT!")
 
         except Exception as e:
-            print(f"  ⚠️ {symbol}: {e}")
+            print(f"  ⚠️ {symbol}: Error - {e}")
 
     save_cooldown(cooldown_data)
-    print(f"\n Done. Sent: {stats['sent']} | Cooldown: {stats['cooldown']} | No signal: {stats['no_signal']}")
+    print("-" * 60)
+    print(f"Done. Sent: {stats['sent']} | Cooldown: {stats['cooldown']} | Rejected: {len(stats['rejected'])}")
+    
+    if stats['sent'] == 0 and len(stats['rejected']) > 0:
+        print("\nMost common rejection reasons:")
+        from collections import Counter
+        reasons = Counter(stats['rejected'].values())
+        for reason, count in reasons.most_common(5):
+            print(f"  • {reason}: {count} coins")
 
 
 if __name__ == "__main__":
